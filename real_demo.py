@@ -1,88 +1,175 @@
+import json
+import requests
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
+from io import BytesIO
+
 # ==========================================
-# 修改后的 run_real_pipeline 函数
+# 0. 准备全模态样本 (All-in-One Data)
+# 我们手动为不同的图片分配不同的任务类型
 # ==========================================
-def run_real_pipeline():
-    print("🚀 启动 ETL 流水线 (Real-World Scenarios)...")
+REAL_SAMPLES = [
+    {
+        # 任务 1: 物体检测 (Detection)
+        "id": "task_bbox_cat",
+        "url": "http://images.cocodataset.org/val2017/000000039769.jpg",
+        "task_type": "detection",
+        "label": "cat",
+        "data": {
+            "bbox": [14, 3, 310, 477] # [x, y, w, h]
+        },
+        "instruction": "Detect the cat."
+    },
+    {
+        # 任务 2: 轨迹预测 (Trajectory) - 模拟滑雪路径
+        "id": "task_traj_skier",
+        "url": "http://images.cocodataset.org/val2017/000000000785.jpg",
+        "task_type": "trajectory",
+        "label": "skier_path",
+        "data": {
+            # 模拟一串点：从头顶滑下来的轨迹 [[x,y], [x,y]...]
+            "points": [[250, 20], [260, 100], [280, 200], [300, 300], [220, 350]]
+        },
+        "instruction": "Predict the future trajectory of the skier."
+    },
+    {
+        # 任务 3: 可供性/操作点 (Affordance) - 模拟机器人应该看向哪里
+        "id": "task_affordance_sign",
+        "url": "http://images.cocodataset.org/val2017/000000000724.jpg",
+        "task_type": "affordance",
+        "label": "stop_sign_center",
+        "data": {
+            # 关注点/抓取点 [x, y]
+            "point": [343, 202] 
+        },
+        "instruction": "Where is the center of the stop sign for interaction?"
+    }
+]
+
+# ==========================================
+# 1. 核心逻辑：通用 ETL 流水线
+# ==========================================
+def download_image(url):
+    print(f"📥 下载中: {url} ...")
+    try:
+        response = requests.get(url, timeout=10)
+        return Image.open(BytesIO(response.content))
+    except:
+        return None
+
+def normalize_coords(coords, w, h, type="bbox"):
+    """万能归一化函数：支持 bbox, point, trajectory"""
+    if type == "bbox":
+        x, y, bw, bh = coords
+        return [round(x/w, 3), round(y/h, 3), round((x+bw)/w, 3), round((y+bh)/h, 3)]
+    elif type == "point":
+        return [round(coords[0]/w, 3), round(coords[1]/h, 3)]
+    elif type == "trajectory":
+        return [[round(p[0]/w, 3), round(p[1]/h, 3)] for p in coords]
+
+def run_multimodal_pipeline():
+    print("🚀 启动全模态空间理解流水线 (BBox + Traj + Affordance)...")
     
     unified_data = []
     
     for item in REAL_SAMPLES:
-        # 1. 实时获取真实图片
-        try:
-            image = download_image(item["url"])
-        except:
-            print(f"⚠️ 下载失败: {item['url']}，跳过...")
-            continue
-            
+        image = download_image(item["url"])
+        if not image: continue
         w, h = image.size
         
-        # 2. 执行数据清洗 (归一化)
-        norm_bbox = normalize_bbox(item["raw_bbox"], w, h)
-        
-        # 3. 填入统一 Schema
+        # --- 1. 构建统一格式 (Unified Schema) ---
         entry = {
             "id": item["id"],
-            "data_source": "coco_2017_val_subset",
-            "task_type": "detection",
-            "media": {
-                "image_url": item["url"],
-                "image_size": [w, h]
-            },
-            "spatial_annotations": [{
-                "label": item["label"],
-                "bbox_2d": norm_bbox
-            }],
-            "conversations": [
-                {
-                    "from": "human",
-                    "value": f"Identify the {item['label']} in the image."
-                },
-                {
-                    "from": "gpt",
-                    "value": f"I found a {item['label']} at <box>{norm_bbox}</box>."
-                }
-            ]
+            "source": "coco_simulated",
+            "task_type": item["task_type"],
+            "media": {"image_size": [w, h], "url": item["url"]},
+            "spatial_annotations": [],
+            "conversations": []
         }
+        
+        # --- 2. 根据不同任务类型处理数据 ---
+        raw_data = item["data"]
+        
+        if item["task_type"] == "detection":
+            norm_box = normalize_coords(raw_data["bbox"], w, h, "bbox")
+            entry["spatial_annotations"].append({
+                "type": "bbox", "value": norm_box, "label": item["label"]
+            })
+            gpt_resp = f"Found at <box>{norm_box}</box>."
+
+        elif item["task_type"] == "trajectory":
+            norm_traj = normalize_coords(raw_data["points"], w, h, "trajectory")
+            entry["spatial_annotations"].append({
+                "type": "trajectory", "value": norm_traj, "label": item["label"]
+            })
+            gpt_resp = f"Trajectory path: <traj>{norm_traj}</traj>."
+
+        elif item["task_type"] == "affordance":
+            norm_point = normalize_coords(raw_data["point"], w, h, "point")
+            entry["spatial_annotations"].append({
+                "type": "point", "value": norm_point, "label": item["label"]
+            })
+            gpt_resp = f"Interact at point: <point>{norm_point}</point>."
+
+        # 填入对话
+        entry["conversations"] = [
+            {"from": "human", "value": item["instruction"]},
+            {"from": "gpt", "value": gpt_resp}
+        ]
+        
         unified_data.append(entry)
         
-        # 【修改点在这里】不再是只存一张，而是每处理一张，就画一张！
-        # 给每张图起个不同的名字，防止覆盖
-        output_filename = f"verify_{item['label'].replace(' ', '_')}.png"
-        visualize_verification(image, entry, output_filename)
+        # --- 3. 可视化验证 (画出不同的形状) ---
+        visualize_task(image, item, f"verify_{item['task_type']}.png")
 
-    # 4. 导出 JSONL
-    with open("unified_spatial_data_real.jsonl", "w", encoding='utf-8') as f:
+    # 保存 JSONL
+    with open("unified_multimodal_data.jsonl", "w") as f:
         for d in unified_data:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-            
-    print("\n✅ 所有数据处理完成! JSONL 已生成。")
+            f.write(json.dumps(d) + "\n")
+    print("✅ 全模态数据处理完成！")
 
 # ==========================================
-# 同时也要微调一下 visualize_verification 函数，让它接收文件名
+# 2. 可视化模块 (根据任务画不同的图)
 # ==========================================
-def visualize_verification(image, entry, save_name):
-    print(f"🎨 正在生成验证图: {save_name} ...")
-    plt.figure(figsize=(10, 8))
+def visualize_task(image, item, save_name):
+    plt.figure(figsize=(8, 8))
     plt.imshow(image)
     ax = plt.gca()
     
-    w_img, h_img = image.size
-    ann = entry["spatial_annotations"][0]
-    box = ann["bbox_2d"]
+    data = item["data"]
+    task = item["task_type"]
     
-    x = box[0] * w_img
-    y = box[1] * h_img
-    w = (box[2] - box[0]) * w_img
-    h = (box[3] - box[1]) * h_img
-    
-    rect = patches.Rectangle((x, y), w, h, linewidth=3, edgecolor='#00FF00', facecolor='none')
-    ax.add_patch(rect)
-    
-    plt.text(x, y-10, f" {ann['label']} ", color='black', fontsize=12, fontweight='bold', bbox=dict(facecolor='#00FF00', edgecolor='none'))
-    
+    if task == "detection":
+        # 画框
+        x, y, w, h = data["bbox"]
+        rect = patches.Rectangle((x, y), w, h, linewidth=3, edgecolor='#00FF00', facecolor='none')
+        ax.add_patch(rect)
+        plt.title(f"Task: Detection (BBox) - {item['label']}")
+        
+    elif task == "trajectory":
+        # 画线 (轨迹)
+        points = data["points"]
+        # 解压 x 和 y 坐标列表
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        # 画红色的轨迹线，带点
+        plt.plot(xs, ys, color='red', linewidth=4, marker='o', markersize=8)
+        plt.title(f"Task: Trajectory (Path) - {item['label']}")
+        
+    elif task == "affordance":
+        # 画点 (热力点/操作点)
+        x, y = data["point"]
+        # 画一个半透明的圆
+        circle = patches.Circle((x, y), radius=20, color='blue', alpha=0.6)
+        ax.add_patch(circle)
+        # 画中心十字
+        plt.plot(x, y, 'w+', markersize=10)
+        plt.title(f"Task: Affordance (Interaction Point) - {item['label']}")
+
     plt.axis('off')
-    plt.title(f"Visual Verification: {entry['id']}")
-    
-    # 使用传入的文件名保存
     plt.savefig(save_name, bbox_inches='tight')
-    plt.close() # 画完这就关掉，释放内存
+    plt.close()
+
+if __name__ == "__main__":
+    run_multimodal_pipeline()
